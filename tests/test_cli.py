@@ -142,3 +142,46 @@ def test_deployment_rejects_invalid_gpu_topology(monkeypatch, capsys):
         == 1
     )
     assert "exceeds the 1 GPUs" in json.loads(capsys.readouterr().err)["error"]
+
+
+def test_estimate_terminal_summary_and_json_alias(monkeypatch, capsys):
+    fits = Mock(
+        side_effect=lambda model, layouts, **kwargs: [
+            HfMemEstimate(GpuFit(True, 2 * 1024**3, count, int(gib * 1024**3), 1, 1024), ()) for count, gib in layouts
+        ]
+    )
+    monkeypatch.setattr(planning, "run_hf_mem_batch", fits)
+    monkeypatch.setenv("COLUMNS", "100")
+    options = ("estimate", "openai-community/gpt2", "--instances", "2", "--hours", "24", "--limit", "1")
+    assert invoke(monkeypatch, *options) == 0
+    output = capsys.readouterr().out
+    assert "Cheapest compatible instance" in output
+    assert "VRAM used / total" in output
+    assert "$58.66 for 24h × 2 replicas" in output
+    assert "hf aws deploy openai-community/gpt2 --instance-type ml.g6.2xlarge --dry-run" in output
+    assert invoke(monkeypatch, "--json", *options) == 0
+    output = capsys.readouterr()
+    assert json.loads(output.out)["matches"][0]["estimated_cost"] == pytest.approx(58.656)
+    assert output.err == ""
+
+
+def test_endpoint_failure_details_are_rendered_as_plain_text(monkeypatch, capsys):
+    data = {"name": "test", "status": "Failed", "failure_reason": "Container [app] failed", "region": "us-east-1"}
+    monkeypatch.setattr(cli, "Deployments", lambda session: Mock(status=Mock(return_value=data)))
+    options = ("deployments", "status", "test", "--region", "us-east-1")
+    assert invoke(monkeypatch, *options) == 0
+    output = capsys.readouterr().out
+    assert "Endpoint status" in output
+    assert "Failure reason" in output
+    assert "Container [app] failed" in output
+    assert invoke(monkeypatch, *options, "-j") == 0
+    assert json.loads(capsys.readouterr().out) == data
+
+
+def test_json_alias_applies_to_nested_argument_errors(monkeypatch, capsys):
+    with pytest.raises(SystemExit) as error:
+        invoke(monkeypatch, "deployments", "logs", "test", "--tail", "10001", "--json")
+    assert error.value.code == 2
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert json.loads(output.err)["error"].endswith("expected between 1 and 10000 lines")

@@ -12,7 +12,10 @@ import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 from huggingface_hub import HfApi
 from huggingface_hub.errors import HfHubHTTPError
+from rich.text import Text
+from rich_argparse import RichHelpFormatter
 
+from hf_aws import display
 from hf_aws._serve import apply_plan
 from hf_aws.deploy_code import deployment_code
 from hf_aws.deployments import Deployments, quotas
@@ -21,8 +24,6 @@ from hf_aws.errors import AwsError, redact
 from hf_aws.hf_mem import EstimateOptions
 from hf_aws.planning import deployment_plan, estimate, hub_token, load_catalog, projection
 
-INSTANCE_COLUMNS = ["instance_type", "accelerator", "gpus", "gib_per_gpu"]
-PRICE_COLUMNS = ["price_per_hour", "deployment_price_per_hour", "estimated_cost"]
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
@@ -32,21 +33,33 @@ def json_default(value: object) -> str:
     raise TypeError(f"Cannot serialize {type(value).__name__}")
 
 
-def emit(args: argparse.Namespace, data: object, columns: list[str] | None = None) -> None:
-    if args.output == "json":
-        print(json.dumps(data, indent=2, ensure_ascii=False, default=json_default))
-    elif columns:
-        if not data:
-            print("No results.")
-            return
-        rows = [columns, *[["" if row.get(key) is None else str(row[key]) for key in columns] for row in data]]
-        widths = [max(map(len, column)) for column in zip(*rows, strict=True)]
-        for row in rows:
-            print("  ".join(cell.ljust(width) for cell, width in zip(row, widths, strict=True)).rstrip())
-    elif isinstance(data, str):
+def emit(args: argparse.Namespace, data: object) -> None:
+    if isinstance(data, str) and args.output != "json":
         print(data)
     else:
         print(json.dumps(data, indent=2, ensure_ascii=False, default=json_default))
+
+
+def emit_endpoint(args: argparse.Namespace, title: str, data: dict) -> None:
+    if args.output == "json":
+        emit(args, data)
+    else:
+        display.endpoint(title, data)
+
+
+def emit_listing(
+    args: argparse.Namespace,
+    title: str,
+    headers: dict[str, str],
+    rows: list[dict],
+    *,
+    empty: str,
+    numeric: tuple[str, ...] = (),
+) -> None:
+    if args.output == "json":
+        emit(args, rows)
+    else:
+        display.listing(title, headers, rows, empty=empty, numeric=numeric)
 
 
 def positive(value: str) -> int:
@@ -56,7 +69,18 @@ def positive(value: str) -> int:
     return number
 
 
+def log_tail(value: str) -> int:
+    number = positive(value)
+    if number > 10000:
+        raise argparse.ArgumentTypeError("expected between 1 and 10000 lines")
+    return number
+
+
 class ArgumentParser(argparse.ArgumentParser):
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("formatter_class", RichHelpFormatter)
+        super().__init__(*args, **kwargs)
+
     def error(self, message: str) -> None:
         print_error(message, output_format(sys.argv[1:]), code=2)
         raise SystemExit(2)
@@ -64,15 +88,34 @@ class ArgumentParser(argparse.ArgumentParser):
 
 def shared_options(parser: argparse.ArgumentParser) -> None:
     # Suppress defaults so options can be passed at any command level.
-    parser.add_argument("-o", "--output", choices=("table", "json"), default=argparse.SUPPRESS)
+    parser.add_argument(
+        "-o",
+        "--output",
+        choices=("table", "json"),
+        default=argparse.SUPPRESS,
+        help="Output format (default: table)",
+    )
+    parser.add_argument(
+        "-j",
+        "--json",
+        action="store_const",
+        const="json",
+        dest="output",
+        default=argparse.SUPPRESS,
+        help="Output machine-readable JSON",
+    )
     parser.add_argument("-r", "--region", default=argparse.SUPPRESS, help="AWS region")
     parser.add_argument("--profile", default=argparse.SUPPRESS, help="AWS shared config profile")
 
 
 def parser() -> argparse.ArgumentParser:
-    root = ArgumentParser(prog="hf aws", description="Plan and deploy Hub models on Amazon SageMaker AI.")
+    root = ArgumentParser(
+        prog="hf aws",
+        usage="%(prog)s [OPTIONS] COMMAND [ARGS]...",
+        description="Plan and deploy Hub models on Amazon SageMaker AI.",
+    )
     shared_options(root)
-    commands = root.add_subparsers(dest="command", required=True)
+    commands = root.add_subparsers(prog=root.prog, dest="command", required=True, title="Commands", metavar="")
 
     def command(name: str, description: str) -> argparse.ArgumentParser:
         child = commands.add_parser(name, help=description, description=description)
@@ -80,62 +123,92 @@ def parser() -> argparse.ArgumentParser:
         return child
 
     models = command("models", "Search the Hugging Face Hub or inspect a model.")
-    models.add_argument("model_id", nargs="?", metavar="MODEL_ID")
-    models.add_argument("--search")
+    models.add_argument("model_id", nargs="?", metavar="MODEL_ID", help="Hub model ID, or list to browse the Hub")
+    models.add_argument("--search", help="Search Hub model names")
     models.add_argument("--task", help="Hub pipeline tag filter for model search")
     models.add_argument("--limit", type=positive, default=20)
 
     instances = command("instances", "List or inspect GPU instances in the bundled SageMaker catalog.")
-    instances.add_argument("instance_type", nargs="?", metavar="INSTANCE_TYPE")
+    instances.add_argument(
+        "instance_type", nargs="?", metavar="INSTANCE_TYPE", help="Inspect a SageMaker SKU such as ml.g6.2xlarge"
+    )
     add_cost_options(instances)
 
     estimation = command("estimate", "Rank SageMaker GPU instances by memory fit and projected cost.")
-    estimation.add_argument("model_id", metavar="MODEL")
-    estimation.add_argument("--instance-type", "-i", help="Estimate one bundled instance type")
-    estimation.add_argument("--tensor-parallel-size", type=positive)
-    estimation.add_argument("--safety-margin", type=float, help="Fraction of GPU memory to reserve")
-    estimation.add_argument("--max-model-len", type=positive, help="Context length in tokens")
-    estimation.add_argument("--batch-size", type=positive, default=1)
-    estimation.add_argument("--kv-cache-dtype", default="auto")
-    estimation.add_argument("--max-num-batched-tokens", type=positive)
-    estimation.add_argument("--revision")
-    estimation.add_argument("--file", help="Specific model weights file")
-    estimation.add_argument("--format", choices=("safetensors", "gguf", "onnx"))
-    estimation.add_argument("--limit", type=positive)
-    estimation.add_argument("--token", help="Hugging Face token for private or gated repositories")
+    estimation.usage = "%(prog)s [OPTIONS] MODEL"
+    estimation.add_argument("model_id", metavar="MODEL", help="Hub model ID, URL, or local model path")
+    comparison = estimation.add_argument_group("Comparison")
+    comparison.add_argument("--instance-type", "-i", help="Estimate one bundled instance type")
+    comparison.add_argument("--tensor-parallel-size", type=positive, metavar="GPUS", help="GPUs used per replica")
+    comparison.add_argument(
+        "--safety-margin", type=float, metavar="FRACTION", help="Fraction of GPU memory to reserve"
+    )
+    comparison.add_argument("--limit", type=positive, metavar="ROWS", help="Maximum number of matching rows to show")
+    workload = estimation.add_argument_group("Workload")
+    workload.add_argument("--max-model-len", type=positive, metavar="TOKENS", help="Context length in tokens")
+    workload.add_argument("--batch-size", type=positive, metavar="SEQUENCES", default=1, help="Concurrent sequences")
+    workload.add_argument(
+        "--kv-cache-dtype", default="auto", metavar="DTYPE", help="KV cache dtype, such as auto or fp8"
+    )
+    workload.add_argument("--max-num-batched-tokens", type=positive, metavar="TOKENS", help="Engine tokens per batch")
+    weights = estimation.add_argument_group("Model selection")
+    weights.add_argument("--revision", help="Hub branch, tag, or commit")
+    weights.add_argument("--file", help="Specific model weights file")
+    weights.add_argument("--format", choices=("safetensors", "gguf", "onnx"), help="Model weights format")
+    weights.add_argument("--token", help="Hugging Face token for private or gated repositories")
     add_cost_options(estimation)
 
     deploy = command("deploy", "Deploy a Hub model or preview the deployment.")
-    deploy.add_argument("model_id", metavar="MODEL_ID")
+    deploy.usage = "%(prog)s [OPTIONS] MODEL_ID"
+    deploy.add_argument("model_id", metavar="MODEL_ID", help="Hugging Face Hub model ID")
     deploy.add_argument("--name", "-n", help="Endpoint name (generated by default)")
     deploy.add_argument("--instance-type", "-i", help="SageMaker SKU (defaults to the cheapest catalog fit)")
-    deploy.add_argument("--instances", "--instance-count", "-c", type=positive, default=1)
-    deploy.add_argument("--tensor-parallel-size", type=positive)
-    role = deploy.add_mutually_exclusive_group()
+    deploy.add_argument("--instances", "--instance-count", "-c", type=positive, default=1, help="Endpoint replicas")
+    deploy.add_argument("--tensor-parallel-size", type=positive, metavar="GPUS", help="vLLM GPUs used per replica")
+    auth = deploy.add_argument_group("Authentication")
+    role = auth.add_mutually_exclusive_group()
     role.add_argument("--role", help="IAM execution role ARN or name")
     role.add_argument("--role-name", help="IAM execution role name")
-    deploy.add_argument("--token", help="Hugging Face token for private or gated repositories")
-    deploy.add_argument("--env", action="append", metavar="KEY=VALUE")
-    deploy.add_argument("--env-file", action="append", type=Path)
-    deploy.add_argument("--no-wait", action="store_true", help="Return after submission")
-    preview = deploy.add_mutually_exclusive_group()
+    auth.add_argument("--token", help="Hugging Face token for private or gated repositories")
+    runtime = deploy.add_argument_group("Serving runtime")
+    runtime.add_argument(
+        "--env", action="append", metavar="KEY=VALUE", help="Set a runtime variable. Repeat as needed."
+    )
+    runtime.add_argument(
+        "--env-file", action="append", type=Path, metavar="PATH", help="Load runtime variables from a file."
+    )
+    execution = deploy.add_argument_group("Execution")
+    execution.add_argument("--no-wait", action="store_true", help="Return after submission")
+    preview = execution.add_mutually_exclusive_group()
     preview.add_argument("--dry-run", action="store_true", help="Print the resolved plan as JSON")
     preview.add_argument("--print-code", action="store_true", help="Export standalone SageMaker SDK Python code")
 
     quota = command("quota", "Show applied AWS quotas for real-time SageMaker endpoint instances.")
-    quota.add_argument("--instance-type", "-i")
+    quota.add_argument("--instance-type", "-i", help="Show quota for one SageMaker instance type")
 
     endpoints = command("deployments", "Manage real-time SageMaker endpoints.")
-    actions = endpoints.add_subparsers(dest="action", required=True)
-    for action in ("list", "status", "describe", "wait", "logs", "invoke", "scale", "delete"):
-        child = actions.add_parser(action)
+    endpoints.usage = "%(prog)s [OPTIONS] COMMAND [ARGS]..."
+    actions = endpoints.add_subparsers(prog=endpoints.prog, dest="action", required=True, title="Commands", metavar="")
+    for action, description in {
+        "list": "List SageMaker endpoints in the selected region.",
+        "status": "Check endpoint status and see any failure reason.",
+        "describe": "Inspect the endpoint, production variants, and models.",
+        "wait": "Wait until an endpoint is ready or has been deleted.",
+        "logs": "Read recent CloudWatch endpoint logs.",
+        "invoke": "Send an inference request to an endpoint.",
+        "scale": "Set the desired instance count for a production variant.",
+        "delete": "Delete a SageMaker endpoint.",
+    }.items():
+        child = actions.add_parser(action, help=description, description=description)
         shared_options(child)
         if action != "list":
-            child.add_argument("name", metavar="ENDPOINT")
+            child.add_argument("name", metavar="ENDPOINT", help="SageMaker endpoint name")
     actions.choices["list"].add_argument("--status", help="AWS endpoint status, such as InService")
-    actions.choices["wait"].add_argument("--deleted", action="store_true")
+    actions.choices["wait"].add_argument(
+        "--deleted", action="store_true", help="Wait for deletion instead of readiness"
+    )
     actions.choices["logs"].add_argument(
-        "--tail", type=positive, choices=range(1, 10001), metavar="1-10000", default=100
+        "--tail", type=log_tail, metavar="LINES", default=100, help="Recent lines to show (1–10000, default: 100)"
     )
     actions.choices["logs"].add_argument("--raw", action="store_true", help="Preserve ANSI escapes")
     scale = actions.choices["scale"]
@@ -156,8 +229,16 @@ def parser() -> argparse.ArgumentParser:
 
 
 def add_cost_options(command: argparse.ArgumentParser) -> None:
-    command.add_argument("--instances", "--instance-count", type=positive, default=1)
-    command.add_argument("--hours", type=float, default=1)
+    cost = command.add_argument_group("Cost projection")
+    cost.add_argument(
+        "--instances",
+        "--instance-count",
+        type=positive,
+        default=1,
+        metavar="COUNT",
+        help="Number of endpoint replicas",
+    )
+    cost.add_argument("--hours", type=float, default=1, metavar="HOURS", help="Continuous running time in hours")
 
 
 def run_models(args: argparse.Namespace) -> None:
@@ -172,7 +253,13 @@ def run_models(args: argparse.Namespace) -> None:
         {"model_id": model.id, "task": model.pipeline_tag, "library": model.library_name, "gated": model.gated}
         for model in models
     ]
-    emit(args, rows, ["model_id", "task", "library", "gated"])
+    emit_listing(
+        args,
+        "Hugging Face Hub Models",
+        {"model_id": "Model", "task": "Task", "library": "Library", "gated": "Gated"},
+        rows,
+        empty="No Hub models matched the search.",
+    )
 
 
 def catalog_output(args: argparse.Namespace) -> None:
@@ -200,7 +287,6 @@ def catalog_output(args: argparse.Namespace) -> None:
             "instances": args.instances,
             "matches": rows,
         }
-        columns = [*INSTANCE_COLUMNS, "startup_timeout_seconds", *PRICE_COLUMNS]
     else:
         options = EstimateOptions(
             revision=args.revision,
@@ -211,29 +297,23 @@ def catalog_output(args: argparse.Namespace) -> None:
             kv_cache_dtype=args.kv_cache_dtype,
             max_num_batched_tokens=args.max_num_batched_tokens,
         )
-        result = estimate(
-            args.model_id,
-            options,
-            instance_type=args.instance_type,
-            tensor_parallel_size=args.tensor_parallel_size,
-            safety_margin=args.safety_margin,
-            count=args.instances,
-            hours=args.hours,
-            token=hub_token(args.token),
-        )
+        with display.activity(f"Estimating GPU memory for {args.model_id}…", enabled=args.output != "json"):
+            result = estimate(
+                args.model_id,
+                options,
+                instance_type=args.instance_type,
+                tensor_parallel_size=args.tensor_parallel_size,
+                safety_margin=args.safety_margin,
+                count=args.instances,
+                hours=args.hours,
+                token=hub_token(args.token),
+            )
         result["total_matches"] = len(result["matches"])
         result["matches"] = result["matches"][: args.limit]
-        columns = [*INSTANCE_COLUMNS, "tensor_parallel_size", *PRICE_COLUMNS]
-    if args.output == "json" or (args.command == "instances" and args.instance_type):
+    if args.output == "json":
         emit(args, result)
-        return
-    region = result["pricing_region"] or "region unspecified"
-    print(f"Bundled catalog from {result['catalog_date']} ({region}, USD). Live pricing and capacity may differ.")
-    if args.command == "estimate":
-        print("Memory fit estimates rely on hf-mem. Runtime support and AWS quota are unverified.")
-        for warning in result["warnings"]:
-            print(warning, file=sys.stderr)
-    emit(args, result["matches"], columns)
+    else:
+        display.catalog(result, region=args.region, profile=args.profile)
 
 
 def run_deploy(args: argparse.Namespace, session: boto3.Session) -> None:
@@ -242,39 +322,53 @@ def run_deploy(args: argparse.Namespace, session: boto3.Session) -> None:
     environment = load_environment(args.env, args.env_file)
     environment_token = environment.pop("HF_TOKEN", None)
     explicit_token = args.token or environment_token
-    plan = deployment_plan(
-        args.model_id,
-        name=args.name,
-        region=session.region_name,
-        profile=args.profile,
-        role=args.role or args.role_name or os.environ.get("SAGEMAKER_ROLE_ARN"),
-        instance_type=args.instance_type,
-        count=args.instances,
-        tensor_parallel_size=args.tensor_parallel_size,
-        environment=environment,
-        token=explicit_token,
-        wait=not args.no_wait,
-    )
+    show_progress = args.output != "json" and not (args.dry_run or args.print_code)
+    with display.activity(f"Resolving SageMaker deployment for {args.model_id}…", enabled=show_progress):
+        plan = deployment_plan(
+            args.model_id,
+            name=args.name,
+            region=session.region_name,
+            profile=args.profile,
+            role=args.role or args.role_name or os.environ.get("SAGEMAKER_ROLE_ARN"),
+            instance_type=args.instance_type,
+            count=args.instances,
+            tensor_parallel_size=args.tensor_parallel_size,
+            environment=environment,
+            token=explicit_token,
+            wait=not args.no_wait,
+        )
     if args.dry_run:
         print(json.dumps(plan.public(), indent=2))
     elif args.print_code:
         print(deployment_code(plan), end="")
     else:
-        emit(args, apply_plan({**plan.public(), "environment": plan.environment}, token=hub_token(explicit_token)))
+        with display.activity(
+            f"Deploying {plan.model_id} to {plan.name} in {plan.region}…", enabled=args.output != "json"
+        ):
+            result = apply_plan({**plan.public(), "environment": plan.environment}, token=hub_token(explicit_token))
+        emit_endpoint(args, "SageMaker deployment", result)
 
 
 def run_deployments(args: argparse.Namespace, session: boto3.Session) -> None:
     endpoints = Deployments(session)
     if args.action == "list":
-        emit(args, endpoints.list(args.status), ["name", "status", "created_at", "updated_at"])
+        emit_listing(
+            args,
+            f"SageMaker Deployments · {session.region_name}",
+            {"name": "Endpoint", "status": "Status", "created_at": "Created", "updated_at": "Updated"},
+            endpoints.list(args.status),
+            empty=f"No SageMaker deployments found in {session.region_name}.",
+        )
     elif args.action == "status":
-        emit(args, endpoints.status(args.name))
+        emit_endpoint(args, "Endpoint status", endpoints.status(args.name))
     elif args.action == "describe":
-        emit(args, endpoints.describe(args.name))
+        emit_endpoint(args, "SageMaker endpoint", endpoints.describe(args.name))
     elif args.action == "wait":
-        emit(args, endpoints.wait(args.name, deleted=args.deleted))
+        with display.activity(f"Waiting for {args.name}…", enabled=args.output != "json"):
+            result = endpoints.wait(args.name, deleted=args.deleted)
+        emit_endpoint(args, "Endpoint status", result)
     elif args.action == "scale":
-        emit(args, endpoints.scale(args.name, args.instances, variant=args.variant))
+        emit_endpoint(args, "Endpoint capacity", endpoints.scale(args.name, args.instances, variant=args.variant))
     elif args.action == "delete":
         if not args.yes:
             if not sys.stdin.isatty():
@@ -282,7 +376,9 @@ def run_deployments(args: argparse.Namespace, session: boto3.Session) -> None:
             print(f"Delete endpoint {args.name} in {session.region_name}? [y/N] ", end="", file=sys.stderr, flush=True)
             if sys.stdin.readline().strip().lower() not in ("y", "yes"):
                 raise AwsError("Deletion cancelled")
-        emit(args, endpoints.delete(args.name, wait=args.wait))
+        with display.activity(f"Deleting {args.name}…", enabled=args.output != "json"):
+            result = endpoints.delete(args.name, wait=args.wait)
+        emit_endpoint(args, "Endpoint deletion", result)
     elif args.action == "logs":
         logs = endpoints.logs(args.name, args.tail)
         if not args.raw:
@@ -300,7 +396,9 @@ def run_deployments(args: argparse.Namespace, session: boto3.Session) -> None:
             payload = endpoints.input_payload(
                 args.name, args.input, args.api, args.model, args.max_tokens, args.variant
             )
-        emit(args, endpoints.invoke(args.name, payload, variant=args.variant))
+        with display.activity(f"Invoking {args.name}…", enabled=args.output != "json"):
+            result = endpoints.invoke(args.name, payload, variant=args.variant)
+        emit(args, result)
 
 
 def run(args: argparse.Namespace) -> None:
@@ -315,10 +413,18 @@ def run(args: argparse.Namespace) -> None:
         if args.command == "deploy":
             run_deploy(args, session)
         elif args.command == "quota":
-            emit(
+            emit_listing(
                 args,
+                f"SageMaker Endpoint Quotas · {session.region_name}",
+                {
+                    "instance_type": "Instance",
+                    "quota": "Quota",
+                    "adjustable": "Adjustable",
+                    "quota_code": "Quota code",
+                },
                 quotas(session, args.instance_type),
-                ["instance_type", "quota", "adjustable", "quota_code", "region"],
+                empty=f"No matching endpoint quota found in {session.region_name}.",
+                numeric=("Quota",),
             )
         else:
             run_deployments(args, session)
@@ -329,7 +435,9 @@ def output_format(argv: list[str]) -> str:
     for index, token in enumerate(argv):
         if token == "--":
             break
-        if token in {"-o", "--output"} and index + 1 < len(argv):
+        if token in {"-j", "--json"}:
+            selected = "json"
+        elif token in {"-o", "--output"} and index + 1 < len(argv):
             selected = argv[index + 1]
         elif token.startswith("--output="):
             selected = token.split("=", 1)[1]
@@ -342,7 +450,7 @@ def print_error(message: str, output: str, *, code: int = 1) -> None:
     if output == "json":
         print(json.dumps({"error": message, "exit_code": code}), file=sys.stderr)
     else:
-        print(f"Error: {message}", file=sys.stderr)
+        display.terminal(stderr=True).print(Text.assemble(("Error: ", "bold red"), message))
 
 
 def main() -> int:

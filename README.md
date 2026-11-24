@@ -108,9 +108,10 @@ AWS deletes the endpoint's serving compute when deletion completes. AWS model
 records, endpoint configurations, logs, and S3 artifacts have independent
 lifecycles and can be managed separately.
 
-Pass `-o json` at any command level for machine-readable results. Errors go
-to stderr, in JSON when JSON output is selected. Dry runs always emit JSON
-and code export emits Python.
+The terminal view highlights endpoint status, compares GPU memory and prices,
+and summarizes the cheapest compatible instance. Pass `--json` or `-o json`
+at any command level for machine-readable results. Errors go to stderr in
+the selected format. Dry runs always emit JSON and code export emits Python.
 
 ## Development
 
