@@ -155,7 +155,9 @@ def test_estimate_terminal_summary_and_json_alias(monkeypatch, capsys):
     options = ("estimate", "openai-community/gpt2", "--instances", "2", "--hours", "24", "--limit", "1")
     assert invoke(monkeypatch, *options) == 0
     output = capsys.readouterr().out
-    assert "Cheapest compatible instance" in output
+    heading = next(line for line in output.splitlines() if "Cheapest compatible instance" in line)
+    assert heading.startswith("╭") and heading.endswith("╮")
+    assert len(heading) < 100
     assert "VRAM used / total" in output
     assert "$58.66 for 24h × 2 replicas" in output
     assert "hf aws deploy openai-community/gpt2 --instance-type ml.g6.2xlarge --dry-run" in output
