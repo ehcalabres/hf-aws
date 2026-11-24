@@ -1,9 +1,8 @@
 # hf-aws
 
 `hf-aws` is a Hugging Face CLI extension for planning and deploying Hub
-models on Amazon SageMaker AI real-time endpoints in your AWS account. It
-extracts the SageMaker workflow from [hf-cloud](https://github.com/ehcalabres/hf-cloud)
-and follows the planning workflow in [hf-msft-foundry](https://github.com/ehcalabres/hf-msft-foundry).
+models on Amazon SageMaker AI real-time endpoints in your AWS account. You can
+also run it directly as the `hf-aws` command.
 
 ## Installation
 
