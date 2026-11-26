@@ -1,10 +1,10 @@
-"""Sample inference payloads for SageMaker ModelBuilder."""
+"""Sample inference payloads for SageMaker endpoints."""
 
 from typing import Any
 
 
 def get_schema_samples(task: str, model_id: str) -> dict[str, Any]:
-    """Sample payloads shared by ModelBuilder deployment and standalone code generation."""
+    """Sample payloads for deployment plans."""
     # Define sample inputs/outputs based on task
     task_schemas = {
         "text-generation": {

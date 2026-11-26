@@ -51,7 +51,7 @@ hf aws quota --region us-east-1 --instance-type ml.g6.2xlarge
 startup timeout, and compute cost. `estimate` runs hf-mem across distinct GPU
 layouts and ranks compatible instances by catalog price. It accepts Hub IDs,
 URLs, local model paths, and weight selectors supported by hf-mem. Deployment
-takes a Hub model ID and lets the serving SDK resolve its weights.
+takes a Hub model ID and resolves a SageMaker ModelPackage specification.
 
 The catalog contains snapshot prices in USD per instance-hour. Prices already
 cover every GPU on an instance. The projected compute cost is the price per
@@ -69,16 +69,74 @@ hf aws deploy openai-community/gpt2 --name gpt2-demo --region us-east-1 \
   --instance-type ml.g6.2xlarge --role-name SageMakerExecutionRole --print-code > deploy.py
 ```
 
-Both previews resolve the same ModelBuilder plan as deployment and make no
-AWS service calls. Omitting the instance type selects the cheapest priced fit
-in the catalog. Text generation uses vLLM and defaults tensor parallelism to the
-selected instance's GPU count. Use `--tensor-parallel-size` to override it.
-Other tasks let ModelBuilder select the serving runtime. Pass repeatable
-`--env KEY=VALUE` or `--env-file PATH` for runtime settings. Inline values
-override files. For offline previews with explicit hardware, provide the task
+Both previews resolve the same ModelPackage specification as deployment. They
+make no AWS service calls. When a recipe is unavailable, the CLI builds a default
+specification and uses the cheapest priced catalog fit if you omit the instance
+type. Text generation uses vLLM and defaults tensor parallelism to the selected
+instance's GPU count. The CLI resolves the default image from the SageMaker SDK
+catalog. For offline default previews with explicit hardware, provide the task
 as `--env HF_TASK=text-generation`.
 
-The generated Python script uses the AWS SDK independently of this extension.
+### Optimized recipes
+
+The CLI looks for recipes in the private
+[hf-rev/sagemaker-recipes](https://huggingface.co/datasets/hf-rev/sagemaker-recipes)
+dataset. Sign in with `hf auth login` using an account with read access.
+
+```bash
+hf aws deploy --list-recipes
+hf aws deploy deepseek-ai/DeepSeek-V4-Flash-0731 --list-recipes
+hf aws deploy deepseek-ai/DeepSeek-V4-Flash-0731 --recipe primary-part-2 --inspect
+```
+
+`deploy MODEL_ID` automatically uses the primary optimized recipe when one is
+available. `--list-recipes` lists all models with recipes when used on its own.
+With a model ID, it compares the primary and named alternatives. `--recipe NAME`
+selects an alternative for deployment or preview.
+`--inspect` shows the configured IAM role, instance type, image URI, and
+environment for each container after applying overrides. Credential values are
+redacted, and automatic IAM role discovery runs during deployment. Use `--json`
+for machine-readable list or inspection output. The `recipes list` and
+`recipes inspect` commands are also available.
+
+To use another source, set `HF_AWS_RECIPE_SOURCE` or pass `--recipe-source`
+with a URI such as `hf://datasets/ORG/DATASET` or `hf://buckets/ORG/BUCKET`.
+Either URI can include a directory prefix. Store a ModelPackage at
+`<model-id>.json`. Its `InferenceSpecification` defines the primary recipe and
+`AdditionalInferenceSpecifications` defines alternatives using each entry's
+`Name` as its selector.
+
+For larger catalogs, store consecutive `<model-id>-part-1.json`,
+`<model-id>-part-2.json`, and so on. The CLI groups the parts under a single
+model. Part 1 supplies `primary`, and subsequent primaries are selectable as
+`primary-part-2`, `primary-part-3`, and so on. Named recipes keep their names.
+If a name occurs in multiple parts, the CLI appends `@part-N` to distinguish
+the options. Inspect and dry-run output identify the source file for the selected
+recipe. When `<model-id>.json` exists, the CLI uses that file.
+
+Deployment planning generates a default ModelPackage when the recipe file is
+absent or the default dataset is unavailable to the caller. An inaccessible
+explicit source or an invalid recipe produces an error.
+
+For images in the SageMaker SDK catalog, the CLI resolves the recipe's pinned
+tag in the AWS session's region or the region supplied with `--region`. For
+newer Hugging Face vLLM tags, it can use the same AWS-owned registry account
+in both regions. Custom ECR images and S3 artifacts referenced by the recipe
+need to be in the deployment region.
+
+For an optimized recipe, the first `SupportedRealtimeInferenceInstanceTypes`
+entry is the default. With `--instance-type`, the CLI uses the primary recipe
+if compatible or chooses the sole alternative that lists that type. When
+multiple alternatives match, select one with `--recipe`. `--instance-type` is
+required for a selected recipe that omits the list. `--tensor-parallel-size`
+overrides recipe tensor parallelism for vLLM. Pass repeatable `--env KEY=VALUE`
+or `--env-file PATH` to override the first container's environment. Inline
+values override files. Use `--token` for a private or gated model loaded by a
+recipe container.
+
+The generated Python script embeds the selected inference specification and
+uses the AWS SDK independently of this extension. The CLI and script use that
+specification to create a SageMaker model, endpoint configuration, and endpoint.
 Hugging Face tokens and credential-like environment values are omitted from
 previews. Supply them through your environment when running the script. Review
 ordinary environment values before sharing a plan or script.
