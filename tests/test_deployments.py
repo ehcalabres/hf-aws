@@ -1,7 +1,9 @@
 import json
+from copy import deepcopy
 from datetime import datetime, timezone
 from io import BytesIO
-from unittest.mock import Mock
+from unittest.mock import Mock, call
+from uuid import UUID
 
 import boto3
 import pytest
@@ -9,7 +11,7 @@ from botocore.exceptions import ClientError
 from botocore.response import StreamingBody
 from botocore.stub import Stubber
 
-from hf_aws import _serve
+from hf_aws import _serve, recipes
 from hf_aws.deployments import Deployments, quotas
 from hf_aws.planning import deployment_plan
 
@@ -117,26 +119,102 @@ def test_quotas_hide_non_endpoint_limits():
     stubber.assert_no_pending_responses()
 
 
-@pytest.mark.parametrize("wait", [True, False])
-def test_apply_plan_builds_and_waits_or_submits(monkeypatch, wait):
-    import sagemaker.serve
-    from sagemaker.core.helper import session_helper
-
+@pytest.mark.parametrize("optimized,wait", [(False, True), (True, False)])
+def test_apply_plan_creates_endpoint_from_model_package(monkeypatch, tmp_path, optimized, wait):
+    model_id = "example/model" if optimized else "openai-community/gpt2"
+    source = None
+    if optimized:
+        source = "hf://datasets/example/recipes"
+        image = f"123456789012.dkr.ecr.{REGION}.amazonaws.com/custom:1"
+        package = recipes.default_package(
+            "example",
+            model_id,
+            image,
+            "ml.p5e.48xlarge",
+            {
+                "SM_VLLM_MODEL": model_id,
+                "SM_VLLM_TENSOR_PARALLEL_SIZE": "8",
+                "SM_VLLM_TOKENIZER_MODE": "auto",
+                "SM_VLLM_MAX_MODEL_LEN": "8192",
+            },
+        )
+        alternative = deepcopy(package["InferenceSpecification"])
+        alternative["Name"] = "long-context"
+        package["AdditionalInferenceSpecifications"] = [alternative]
+        package["InferenceSpecification"]["Containers"][0]["Environment"]["SM_VLLM_MAX_MODEL_LEN"] = "2048"
+        path = tmp_path / "recipe.json"
+        path.write_text(json.dumps(package), encoding="utf-8")
+        monkeypatch.setattr(recipes, "hf_hub_download", Mock(return_value=path))
     plan = deployment_plan(
-        "openai-community/gpt2",
+        model_id,
         name=NAME,
         region=REGION,
         profile="test",
         role=ROLE_ARN,
-        instance_type="ml.g5.12xlarge",
+        instance_type=None if optimized else "ml.g5.12xlarge",
         count=2,
-        tensor_parallel_size=2,
+        tensor_parallel_size=None if optimized else 2,
         environment={"HF_TASK": "text-generation"},
         token="fake-token",
         wait=wait,
+        recipe_source=source,
+        recipe_name="long-context" if optimized else None,
     )
     client, stubber = stubbed("sagemaker")
     stubber.add_client_error("describe_endpoint", "ValidationException", MISSING_ENDPOINT, expected_params=ENDPOINT)
+    monkeypatch.setattr(_serve, "uuid4", lambda: UUID("12345678-1234-1234-1234-123456789abc"))
+    resource = f"{NAME}-12345678"
+    arn = f"arn:aws:sagemaker:{REGION}:123456789012"
+    spec = plan.public()["model_package"]["InferenceSpecification"]
+    container = spec["Containers"][0]
+    assert container["Environment"]["SM_VLLM_MODEL"] == model_id
+    assert container["Environment"]["SM_VLLM_TENSOR_PARALLEL_SIZE"] == ("8" if optimized else "2")
+    assert container["Environment"]["SM_VLLM_HOST"] == "0.0.0.0"
+    if optimized:
+        assert container["Environment"]["SM_VLLM_TOKENIZER_MODE"] == "auto"
+        assert container["Environment"]["SM_VLLM_MAX_MODEL_LEN"] == "8192"
+        assert container["Image"] == image
+    stubber.add_response(
+        "create_model",
+        {"ModelArn": f"{arn}:model/{resource}"},
+        {
+            "ModelName": resource,
+            "ExecutionRoleArn": ROLE_ARN,
+            "PrimaryContainer": {
+                **container,
+                "Environment": {
+                    **container["Environment"],
+                    "HF_TOKEN": "fake-token",
+                    "HUGGING_FACE_HUB_TOKEN": "fake-token",
+                },
+            },
+        },
+    )
+    variant = {
+        "VariantName": "AllTraffic",
+        "ModelName": resource,
+        "InstanceType": "ml.p5e.48xlarge" if optimized else "ml.g5.12xlarge",
+        "InitialInstanceCount": 2,
+        "ContainerStartupHealthCheckTimeoutInSeconds": 3600 if optimized else 1800,
+    }
+    if "-cu130-" in container["Image"]:
+        variant["InferenceAmiVersion"] = "al2023-ami-sagemaker-inference-gpu-4-1"
+    stubber.add_response(
+        "create_endpoint_config",
+        {"EndpointConfigArn": f"{arn}:endpoint-config/{resource}"},
+        {"EndpointConfigName": resource, "ProductionVariants": [variant]},
+    )
+    request = {**ENDPOINT, "EndpointConfigName": resource}
+    if optimized:
+        stubber.add_client_error(
+            "create_endpoint",
+            "ValidationException",
+            f"Could not find endpoint configuration {resource}",
+            expected_params=request,
+        )
+    stubber.add_response("create_endpoint", {"EndpointArn": f"{arn}:endpoint/{NAME}"}, request)
+    sleep = Mock()
+    monkeypatch.setattr(_serve, "sleep", sleep)
     iam = Mock()
     iam.get_role.return_value = {
         "Role": {
@@ -154,25 +232,13 @@ def test_apply_plan_builds_and_waits_or_submits(monkeypatch, wait):
     }
     session = Mock(client=Mock(side_effect={"sagemaker": client, "iam": iam}.__getitem__), region_name=REGION)
     monkeypatch.setattr(_serve.boto3, "Session", Mock(return_value=session))
-    monkeypatch.setattr(session_helper, "Session", Mock())
-    builder = Mock()
-    monkeypatch.setattr(sagemaker.serve, "ModelBuilder", builder)
     waiter = Mock()
     monkeypatch.setattr(_serve, "wait_for_endpoint", waiter)
     with stubber:
         result = _serve.apply_plan(plan.public(), token="fake-token")
+    stubber.assert_no_pending_responses()
     iam.get_role.assert_called_once_with(RoleName="sagemaker")
-    assert builder.call_args.kwargs["model_server"] == sagemaker.serve.ModelServer.VLLM
-    assert builder.call_args.kwargs["env_vars"]["HF_TOKEN"] == "fake-token"
-    assert builder.call_args.kwargs["env_vars"]["SM_VLLM_TENSOR_PARALLEL_SIZE"] == "2"
-    builder.return_value.build.assert_called_once()
-    builder.return_value.deploy.assert_called_once_with(
-        endpoint_name=NAME,
-        instance_type="ml.g5.12xlarge",
-        initial_instance_count=2,
-        container_timeout_in_seconds=1800,
-        wait=False,
-    )
+    assert sleep.call_args_list == ([call(1)] if optimized else [])
     if wait:
         waiter.assert_called_once_with(client, NAME)
         assert result["status"] == "InService"

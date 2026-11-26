@@ -1,5 +1,6 @@
 """Rich terminal output for SageMaker planning and endpoint commands."""
 
+import json
 import shlex
 from collections.abc import Iterable
 from contextlib import nullcontext
@@ -104,6 +105,60 @@ def listing(
         numeric=numeric,
         empty=empty,
     )
+
+
+def recipe(data: dict) -> None:
+    console = terminal()
+    source = "Generated default" if data["recipe_source"] == "default" else data["recipe_source"]
+    title = f"{data['recipe_name']} · {source}" if data["recipe_name"] else source
+    console.print(Text(title, style="bold"))
+    console.print(
+        fields(
+            [
+                ("Role", value(data["role"] or "Resolved at deployment")),
+                ("Instance", value(data["instance_type"])),
+            ]
+        )
+    )
+    for index, container in enumerate(data["containers"], 1):
+        if len(data["containers"]) > 1:
+            console.print(Text(f"Container {index}", style="bold"))
+        console.print(Text.assemble(("Image URI", "bold"), "    ", container["image_uri"]), soft_wrap=True)
+        env = "\n".join(
+            f"{key}={json.dumps(item, ensure_ascii=False)}" for key, item in container["environment"].items()
+        )
+        console.print(fields([("Environment", Text(env, overflow="fold") if env else value(None))]))
+    if len(data["available_recipes"]) > 1:
+        console.print("Use --list-recipes to compare the available recipes.", style="dim")
+
+
+def model_recipes(model_id: str, source: str, rows: list[dict]) -> None:
+    console = terminal()
+    table(
+        console,
+        f"SageMaker recipes for {model_id} · {source}",
+        ("Recipe", "Instance types", "Context", "Features"),
+        (
+            (
+                Text(f"{row['name']} (default)" if row["primary"] else row["name"], overflow="fold"),
+                value(", ".join(row["instances"]) or None),
+                value(row["context_tokens"]),
+                value(", ".join(row["features"]) or None),
+            )
+            for row in rows
+        ),
+        numeric=("Context",),
+        empty=f"No optimized recipes found for {model_id}. Deployment will use generated settings.",
+    )
+    if len(rows) > 1:
+        console.print(Text(f"Preview an option with hf aws deploy {model_id} --recipe NAME --inspect", style="dim"))
+
+
+def using_recipe(name: str | None, available: list[str]) -> None:
+    message = f"Using SageMaker recipe {name}." if name else "Using generated deployment settings."
+    if len(available) > 1:
+        message += " Use --list-recipes to see alternatives."
+    terminal(stderr=True).print(Text(message, style="dim"))
 
 
 def accelerator(row: dict) -> str:

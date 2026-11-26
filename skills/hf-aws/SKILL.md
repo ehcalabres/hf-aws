@@ -11,6 +11,10 @@ standalone `hf-aws` executable. Check `hf aws --help` for command options.
 - Run `hf aws estimate MODEL_ID --hours HOURS --instances COUNT -o json` to
   compare GPU memory fit and projected compute charges. Check regional
   endpoint quota with `hf aws quota --instance-type SKU --region REGION`.
+- Use `hf aws deploy MODEL_ID --list-recipes` to compare optimized recipes and
+  `hf aws deploy MODEL_ID --recipe NAME --inspect` to preview a specific option.
+  Use `hf aws recipes list` to browse models with recipes. Sign in to Hugging
+  Face for private recipe sources.
 - Review `hf aws deploy MODEL_ID --name NAME --region REGION --instance-type SKU --dry-run`
   before creating an endpoint. Export equivalent Python with `--print-code`.
 - Deploy with the approved AWS profile, region, and execution role.

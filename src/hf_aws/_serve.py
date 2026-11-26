@@ -1,19 +1,23 @@
-"""SageMaker ModelBuilder execution shared by the extension and generated scripts."""
+"""SageMaker endpoint creation shared by the extension and generated scripts."""
 
 import json
 import os
 import re
 import sys
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from fnmatch import fnmatchcase
+from time import sleep
 from typing import Any
 from urllib.parse import unquote
+from uuid import uuid4
 
 import boto3
-from botocore.exceptions import ClientError, WaiterError
+from botocore.exceptions import BotoCoreError, ClientError, WaiterError
 from huggingface_hub import get_token
 
 SAGEMAKER_PRINCIPAL = "sagemaker.amazonaws.com"
+CONTAINER_FIELDS = ("ContainerHostname", "ModelDataUrl", "ModelDataSource", "AdditionalModelDataSources")
+CUDA_13_FAMILIES = {"g4dn", "g5", "g6", "g6e", "p4d", "p4de", "p5", "p5e", "p5en"}
 
 
 def _values(value: Any) -> list:
@@ -69,8 +73,7 @@ def _condition_matches(operator: str, key: str, values: Any, arn: str, region: s
             elif positive == "StringEquals":
                 matches.append(False if "*" in parts[5] or "?" in parts[5] else None)
             else:
-                # ModelBuilder chooses model resource names later. Only a full
-                # resource wildcard can be confirmed before creating the model.
+                # Only a full resource wildcard can be confirmed here.
                 matches.append(True if parts[5] == "*" else None)
         else:
             matches.append(None)
@@ -115,13 +118,13 @@ def validate_role_trust(role: dict, region: str) -> bool:
     return True in allowed and None not in denied
 
 
-def resolve_execution_role(boto_session, sdk_session, identifier: str | None) -> str:
-    from sagemaker.core.helper.session_helper import get_execution_role
-
+def resolve_execution_role(boto_session, identifier: str | None) -> str:
     identifier = identifier or os.environ.get("SAGEMAKER_ROLE_ARN")
     if identifier is None:
+        from sagemaker.core.helper.session_helper import Session, get_execution_role
+
         try:
-            identifier = get_execution_role(sagemaker_session=sdk_session)
+            identifier = get_execution_role(sagemaker_session=Session(boto_session=boto_session))
         except ValueError:
             identifier = "sagemaker_execution_role"
     is_arn = identifier.startswith("arn:")
@@ -165,27 +168,69 @@ def wait_for_endpoint(client, name: str, *, deleted: bool = False) -> None:
         raise ValueError(f"Endpoint '{name}' waiter failed ({status or 'unknown status'}): {reason}") from error
 
 
-def deployment_environment(plan: dict, token: str | None) -> dict[str, str]:
-    env = dict(plan["environment"])
-    for key in plan["secret_environment"]:
+def deployment_environment(plan: dict, token: str | None, index: int = 0) -> dict[str, str]:
+    container = plan["model_package"]["InferenceSpecification"]["Containers"][index]
+    env = dict(container.get("Environment", {}))
+    for key in plan["container_secret_environment"][index]:
         if key not in env:
             if key not in os.environ:
                 raise ValueError(f"Set {key} in the environment before running the exported script")
             env[key] = os.environ[key]
-    if plan["use_hf_token"]:
+    if index == 0 and plan["use_hf_token"]:
         env["HF_TOKEN"] = token or get_token() or ""
         if not env["HF_TOKEN"]:
             raise ValueError("Model access requires a Hugging Face token. Run hf auth login or set HF_TOKEN")
+        env.setdefault("HUGGING_FACE_HUB_TOKEN", env["HF_TOKEN"])
     return env
+
+
+def deployment_image(spec: dict) -> str:
+    image = spec["Image"]
+    if digest := spec.get("ImageDigest"):
+        repository = image.split("@", 1)[0]
+        registry, _, name = repository.rpartition("/")
+        return f"{registry}/{name.partition(':')[0]}@{digest.lower()}"
+    return image
+
+
+def deployment_containers(plan: dict, token: str | None) -> list[dict]:
+    containers = []
+    for index, spec in enumerate(plan["model_package"]["InferenceSpecification"]["Containers"]):
+        container = {key: spec[key] for key in CONTAINER_FIELDS if key in spec}
+        container["Image"] = deployment_image(spec)
+        if environment := deployment_environment(plan, token, index):
+            container["Environment"] = environment
+        containers.append(container)
+    return containers
+
+
+def _delete_created(delete, **params) -> None:
+    try:
+        delete(**params)
+    except (BotoCoreError, ClientError) as error:
+        print(f"Could not clean up deployment resources {params}: {error}", file=sys.stderr)
+
+
+def _create_endpoint(client, name: str, config: str) -> None:
+    # SageMaker can briefly report that a newly created endpoint config is missing.
+    for delay in (1, 2, 4, None):
+        try:
+            client.create_endpoint(EndpointName=name, EndpointConfigName=config)
+            return
+        except ClientError as error:
+            details = error.response.get("Error", {})
+            message = details.get("Message", "").lower()
+            missing = config.lower() in message and any(
+                phrase in message for phrase in ("could not find", "does not exist", "not found")
+            )
+            if delay is None or details.get("Code") != "ValidationException" or not missing:
+                raise
+            sleep(delay)
 
 
 def apply_plan(plan: dict, *, token: str | None = None) -> dict:
     with redirect_stdout(sys.stderr):
-        from sagemaker.core.helper.session_helper import Session
-        from sagemaker.serve import ModelBuilder, ModelServer
-        from sagemaker.serve.builder.schema_builder import SchemaBuilder
-
-        env = deployment_environment(plan, token)
+        containers = deployment_containers(plan, token)
         boto_session = boto3.Session(region_name=plan["region"], profile_name=plan["profile"])
         client = boto_session.client("sagemaker")
         name = plan["name"]
@@ -197,27 +242,40 @@ def apply_plan(plan: dict, *, token: str | None = None) -> dict:
         else:
             raise ValueError(f"Endpoint '{name}' already exists in {plan['region']}")
 
-        session = Session(boto_session=boto_session)
-        role = resolve_execution_role(boto_session, session, plan["role"])
-        server = {"model_server": ModelServer.VLLM} if plan["model_server"] == "vllm" else {}
-        builder = ModelBuilder(
-            model=plan["model_id"],
-            role_arn=role,
-            sagemaker_session=session,
-            instance_type=plan["instance_type"],
-            schema_builder=SchemaBuilder(**plan["schema"]),
-            env_vars=env,
-            model_metadata={"HF_TASK": plan["task"]},
-            **server,
-        )
-        builder.build()
-        builder.deploy(
-            endpoint_name=name,
-            instance_type=plan["instance_type"],
-            initial_instance_count=plan["instance_count"],
-            container_timeout_in_seconds=plan["startup_timeout_seconds"],
-            wait=False,
-        )
+        role = resolve_execution_role(boto_session, plan["role"])
+        resource_name = f"{name[:54].rstrip('-')}-{uuid4().hex[:8]}"
+        variant = {
+            "VariantName": "AllTraffic",
+            "ModelName": resource_name,
+            "InstanceType": plan["instance_type"],
+            "InitialInstanceCount": plan["instance_count"],
+            "ContainerStartupHealthCheckTimeoutInSeconds": plan["startup_timeout_seconds"],
+        }
+        family = plan["instance_type"].split(".")[1]
+        if family in CUDA_13_FAMILIES and any(
+            "cu130" in container["Image"].rpartition(":")[2].split("-")
+            for container in plan["model_package"]["InferenceSpecification"]["Containers"]
+        ):
+            variant["InferenceAmiVersion"] = "al2023-ami-sagemaker-inference-gpu-4-1"
+
+        # Separate names let concurrent attempts clean up only their own resources.
+        definition = {"PrimaryContainer": containers[0]} if len(containers) == 1 else {"Containers": containers}
+        with ExitStack() as cleanup:
+            try:
+                client.create_model(ModelName=resource_name, ExecutionRoleArn=role, **definition)
+                cleanup.callback(_delete_created, client.delete_model, ModelName=resource_name)
+                client.create_endpoint_config(EndpointConfigName=resource_name, ProductionVariants=[variant])
+                cleanup.callback(_delete_created, client.delete_endpoint_config, EndpointConfigName=resource_name)
+                _create_endpoint(client, name, resource_name)
+            except ClientError as error:
+                if error.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 500) >= 500:
+                    cleanup.pop_all()
+                raise
+            except BaseException:
+                # A transport failure or interruption can leave submission status unknown.
+                cleanup.pop_all()
+                raise
+            cleanup.pop_all()
         if plan["wait"]:
             wait_for_endpoint(client, name)
             status = "InService"

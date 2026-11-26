@@ -3,6 +3,7 @@
 import json
 import math
 import re
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from importlib.resources import files
 from uuid import uuid4
@@ -13,11 +14,18 @@ from huggingface_hub.utils import validate_repo_id
 from hf_aws.environment import validate_environment
 from hf_aws.errors import AwsError
 from hf_aws.hf_mem import HF_MEM_VERSION, EstimateOptions, InstanceData, InstanceInfo, run_hf_mem_batch
+from hf_aws.recipes import (
+    INSTANCE_TYPE,
+    SECRET_NAME,
+    default_package,
+    image_for_region,
+    load_recipes,
+    select_recipe,
+)
 from hf_aws.schemas import get_schema_samples
 
 ENDPOINT_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
-INSTANCE_TYPE = re.compile(r"ml\.[a-z0-9]+\.[a-z0-9]+")
-SECRET_NAME = re.compile(r"TOKEN|PASSWORD|SECRET|CREDENTIAL|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY", re.IGNORECASE)
+VLLM_TASKS = {"text-generation", "image-text-to-text", "audio-text-to-text", "any-to-any"}
 
 
 def load_catalog() -> InstanceData:
@@ -120,17 +128,48 @@ class DeploymentPlan:
     instance_count: int
     tensor_parallel_size: int | None
     startup_timeout_seconds: int
-    environment: dict[str, str]
-    secret_environment: list[str]
+    model_package: dict
+    recipe_source: str
+    recipe_name: str | None
+    available_recipes: list[str]
     use_hf_token: bool
     schema: dict
     wait: bool
 
-    def public(self) -> dict:
+    def request(self, *, redact_secrets: bool = False) -> dict:
         plan = asdict(self)
-        for key in self.secret_environment:
-            del plan["environment"][key]
+        package = plan["model_package"]
+        spec = package["InferenceSpecification"]
+        plan["container_secret_environment"] = [
+            sorted(key for key in container.get("Environment", {}) if SECRET_NAME.search(key))
+            for container in spec["Containers"]
+        ]
+        if redact_secrets:
+            for container in spec["Containers"]:
+                if "Environment" in container:
+                    container["Environment"] = {
+                        key: value for key, value in container["Environment"].items() if not SECRET_NAME.search(key)
+                    }
+        plan["environment"] = spec["Containers"][0].get("Environment", {})
+        plan["secret_environment"] = plan["container_secret_environment"][0]
         return plan
+
+    def public(self) -> dict:
+        return self.request(redact_secrets=True)
+
+
+def default_image(task: str, region: str, instance_type: str) -> tuple[str, str]:
+    from sagemaker.core import image_uris
+
+    options = {"region": region, "instance_type": instance_type, "image_scope": "inference"}
+    if task in VLLM_TASKS:
+        framework = "huggingface-vllm-omni" if task == "any-to-any" else "huggingface-vllm"
+        return "vllm", image_uris.retrieve(framework, **options)
+    if task in {"feature-extraction", "sentence-similarity", "text-ranking"}:
+        family = instance_type.split(".")[1]
+        framework = "huggingface-tei" if family.startswith(("g", "p")) else "huggingface-tei-cpu"
+        return "tei", image_uris.retrieve(framework, **options)
+    return "transformers", image_uris.retrieve("huggingface", base_framework_version="pytorch2.6.0", **options)
 
 
 def deployment_plan(
@@ -146,6 +185,9 @@ def deployment_plan(
     environment: dict[str, str],
     token: str | None,
     wait: bool,
+    recipe_source: str | None = None,
+    recipe_name: str | None = None,
+    use_default_recipe_source: bool = False,
 ) -> DeploymentPlan:
     validate_repo_id(model_id)
     if count < 1:
@@ -164,14 +206,53 @@ def deployment_plan(
             raise AwsError(f"{key} is set by the deployment plan. Use MODEL_ID, --tensor-parallel-size, or --token")
     task = custom.get("HF_TASK") or None
     use_hf_token = token is not None
-    if not task:
-        info = HfApi().model_info(model_id, token=token)
-        task = info.pipeline_tag or "text-generation"
-        use_hf_token = use_hf_token or bool(info.gated or info.private)
+    options = load_recipes(model_id, recipe_source, token, use_default_source=use_default_recipe_source)
+    package, source = None, "default"
+    engine_ready_timeout = 0
+    if options:
+        recipe_name = select_recipe(options, recipe_name, instance_type, model_id)
+        option = options[recipe_name]
+        source = option.source
+        spec = deepcopy(option.specification)
+        spec.pop("Name", None)
+        spec.pop("Description", None)
+        package = {key: value for key, value in option.package.items() if key != "AdditionalInferenceSpecifications"}
+        package["InferenceSpecification"] = spec
+        containers = spec["Containers"]
+        if any(container.get("ProductId") or container.get("AdditionalS3DataSource") for container in containers):
+            raise AwsError(f"Recipe '{recipe_name}' requires a registered SageMaker model package for deployment")
+        supported = spec.get("SupportedRealtimeInferenceInstanceTypes", [])
+        if instance_type is None:
+            if not supported:
+                raise AwsError(f"Recipe '{recipe_name}' has no instance type list. Specify --instance-type")
+            instance_type = supported[0]
+        if supported and instance_type not in supported:
+            raise AwsError(f"Recipe '{recipe_name}' supports these real-time instances: {', '.join(supported)}")
+        for container in containers:
+            container["Image"] = image_for_region(container["Image"], region, instance_type, source)
+            if "SM_VLLM_MODEL" in container.get("Environment", {}):
+                container["Environment"].setdefault("SM_VLLM_HOST", "0.0.0.0")
+        primary = containers[0]
+        env = {**primary.get("Environment", {}), **custom}
+        primary["Environment"] = env
+        vllm = "SM_VLLM_MODEL" in env or "vllm" in primary["Image"].split("/", 1)[-1].split(":", 1)[0]
+        for container in containers:
+            timeout = container.get("Environment", {}).get("VLLM_ENGINE_READY_TIMEOUT_S", "")
+            if timeout.isdecimal():
+                engine_ready_timeout = max(engine_ready_timeout, min(int(timeout), 3600))
+        task = task or env.get("HF_TASK") or package.get("Task") or ("text-generation" if vllm else "unknown")
+        server = "vllm" if vllm else "custom"
+    else:
+        if recipe_name is not None:
+            raise AwsError(f"No optimized recipes are available for {model_id}. Check the model ID and recipe source")
+        if not task:
+            info = HfApi().model_info(model_id, token=token)
+            task = info.pipeline_tag or "text-generation"
+            use_hf_token = use_hf_token or bool(info.gated or info.private)
+        vllm = task in VLLM_TASKS
 
-    vllm = task == "text-generation"
     if tensor_parallel_size is not None and (not vllm or tensor_parallel_size < 1):
-        raise AwsError("--tensor-parallel-size requires text generation and a positive GPU count")
+        raise AwsError("--tensor-parallel-size requires vLLM and a positive GPU count")
     if instance_type is None:
         matches = estimate(model_id, EstimateOptions(), tensor_parallel_size=tensor_parallel_size, token=token)[
             "matches"
@@ -180,16 +261,31 @@ def deployment_plan(
             raise AwsError("No priced catalog instance fits this model. Run estimate or specify --instance-type")
         instance_type = matches[0]["instance_type"]
     item = next((entry for entry in load_catalog().instances if entry["instanceType"] == instance_type), {})
-    if item and tensor_parallel_size and tensor_parallel_size > item["numGpu"]:
-        raise AwsError(f"--tensor-parallel-size exceeds the {item['numGpu']} GPUs on {instance_type}")
-
-    parallel = (tensor_parallel_size or item.get("numGpu", 1)) if vllm else None
-    defaults = {"HF_TASK": task}
-    if vllm:
-        defaults.update(SM_VLLM_MODEL=model_id, SM_VLLM_TENSOR_PARALLEL_SIZE=str(parallel))
+    parallel = tensor_parallel_size
+    if package is not None:
+        if parallel is not None:
+            env["SM_VLLM_TENSOR_PARALLEL_SIZE"] = str(parallel)
+        if (configured := env.get("SM_VLLM_TENSOR_PARALLEL_SIZE")) is not None:
+            if not re.fullmatch(r"[1-9][0-9]*", configured):
+                raise AwsError(f"Invalid SM_VLLM_TENSOR_PARALLEL_SIZE in {source}")
+            parallel = int(configured)
     else:
-        defaults["HF_MODEL_ID"] = model_id
-    env = {**custom, **defaults}
+        parallel = (parallel or item.get("numGpu", 1)) if vllm else None
+    if item and parallel and parallel > item["numGpu"]:
+        raise AwsError(f"Tensor parallel size exceeds the {item['numGpu']} GPUs on {instance_type}")
+
+    if package is None:
+        server, image = default_image(task, region, instance_type)
+        env = {**custom, "HF_TASK": task}
+        if vllm:
+            env.update(SM_VLLM_MODEL=model_id, SM_VLLM_TENSOR_PARALLEL_SIZE=str(parallel))
+            env.setdefault("SM_VLLM_HOST", "0.0.0.0")
+        else:
+            env["HF_MODEL_ID"] = model_id
+            if server == "tei":
+                env.setdefault("MODEL_ID", model_id)
+        env.setdefault("HF_HOME", "/tmp")
+        package = default_package(name, model_id, image, instance_type, env)
     return DeploymentPlan(
         model_id,
         name,
@@ -197,13 +293,15 @@ def deployment_plan(
         profile,
         role,
         task,
-        "vllm" if vllm else "auto",
+        server,
         instance_type,
         count,
         parallel,
-        item.get("startupTimeoutSeconds", 900),
-        env,
-        sorted(key for key in custom if SECRET_NAME.search(key)),
+        max(item.get("startupTimeoutSeconds", 900), engine_ready_timeout),
+        package,
+        source,
+        recipe_name,
+        list(options),
         use_hf_token,
         get_schema_samples(task, model_id),
         wait,
